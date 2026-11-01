@@ -1,5 +1,5 @@
 {
-  description = "SoundFetch - lightweight SoundCloud downloader GUI";
+  description = "SoundFetch - lightweight yt-dlp desktop client";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -34,7 +34,7 @@
             '';
 
             meta = {
-              description = "A lightweight SoundCloud downloader with a C++ GUI and Go backend";
+              description = "A lightweight yt-dlp downloader with a C++ GUI and Go backend";
               license = lib.licenses.mit;
               platforms = [ "x86_64-linux" "aarch64-linux" ];
               mainProgram = "soundfetch";
