@@ -24,16 +24,21 @@ const defaultWorkers = 3
 
 // Request is one command from the C++ frontend.
 type Request struct {
-	Cmd          string  `json:"cmd"`
-	RequestID    string  `json:"requestId,omitempty"`
-	JobID        string  `json:"jobId,omitempty"`
-	URL          string  `json:"url,omitempty"`
-	Items        []Track `json:"items,omitempty"`
-	Quality      string  `json:"quality,omitempty"`
-	OutputDir    string  `json:"outputDir,omitempty"`
-	ProxyEnabled bool    `json:"proxyEnabled,omitempty"`
-	ProxyURL     string  `json:"proxyUrl,omitempty"`
-	Concurrency  int     `json:"concurrency,omitempty"`
+	Cmd            string  `json:"cmd"`
+	RequestID      string  `json:"requestId,omitempty"`
+	JobID          string  `json:"jobId,omitempty"`
+	URL            string  `json:"url,omitempty"`
+	Items          []Track `json:"items,omitempty"`
+	Quality        string  `json:"quality,omitempty"` // legacy audio-quality field
+	MediaMode      string  `json:"mediaMode,omitempty"`
+	AudioQuality   string  `json:"audioQuality,omitempty"`
+	VideoQuality   string  `json:"videoQuality,omitempty"`
+	EmbedThumbnail *bool   `json:"embedThumbnail,omitempty"`
+	EmbedSubtitles bool    `json:"embedSubtitles,omitempty"`
+	OutputDir      string  `json:"outputDir,omitempty"`
+	ProxyEnabled   bool    `json:"proxyEnabled,omitempty"`
+	ProxyURL       string  `json:"proxyUrl,omitempty"`
+	Concurrency    int     `json:"concurrency,omitempty"`
 }
 
 type Track struct {
@@ -157,21 +162,27 @@ func (s *Service) proxyArgs(enabled bool, raw string) ([]string, error) {
 	return []string{"--proxy", u.String()}, nil
 }
 
-func validateSoundCloudURL(raw string) error {
+func validateMediaURL(raw string) error {
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
-		return errors.New("paste a complete http(s) SoundCloud URL")
+	scheme := ""
+	if u != nil {
+		scheme = strings.ToLower(u.Scheme)
 	}
-	host := strings.ToLower(u.Hostname())
-	if !(host == "soundcloud.com" || strings.HasSuffix(host, ".soundcloud.com") || host == "sndcdn.com" || strings.HasSuffix(host, ".sndcdn.com")) {
-		return errors.New("only SoundCloud links are supported")
+	if err != nil || u == nil || u.Hostname() == "" || (scheme != "https" && scheme != "http") {
+		return errors.New("paste a complete http(s) URL supported by yt-dlp")
+	}
+	if u.User != nil {
+		return errors.New("URLs containing embedded usernames or passwords are not accepted")
+	}
+	if strings.ContainsAny(u.Host, "\r\n\t ") {
+		return errors.New("URL contains invalid host characters")
 	}
 	return nil
 }
 
 func (s *Service) fetch(req Request) {
 	base := Event{"requestId": req.RequestID}
-	if err := validateSoundCloudURL(req.URL); err != nil {
+	if err := validateMediaURL(req.URL); err != nil {
 		base["event"] = "fetch_error"
 		base["message"] = err.Error()
 		s.emit(base)
@@ -185,10 +196,10 @@ func (s *Service) fetch(req Request) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	// Do not use --flat-playlist here: SoundCloud's flat entries can omit
-	// title/uploader/thumbnail metadata. Full playlist extraction resolves the
-	// track fields once so the UI and download queue do not fall back to
-	// "Untitled track". It still skips media downloads and only returns JSON.
+	// Do not use --flat-playlist here: flat entries can omit title, uploader
+	// and thumbnail metadata. Full list extraction resolves those values once
+	// so the UI and download queue do not fall back to generic titles. This
+	// still skips media downloads and only returns JSON.
 	args := []string{"--dump-single-json", "--no-warnings", "--no-call-home", "--socket-timeout", "20", "--skip-download", "--yes-playlist", "--no-progress"}
 	args = append(args, proxy...)
 	args = append(args, req.URL)
@@ -227,7 +238,7 @@ func (s *Service) fetch(req Request) {
 		tracks = append(tracks, track)
 	}
 	if len(tracks) == 0 {
-		base["event"], base["message"] = "fetch_error", "No downloadable public tracks were found at this URL."
+		base["event"], base["message"] = "fetch_error", "No downloadable media items were found at this URL."
 		s.emit(base)
 		return
 	}
@@ -261,16 +272,19 @@ func trackFromMap(m map[string]any) (Track, bool) {
 		}
 	}
 	if t.URL == "" && t.ID != "" {
-		t.URL = "https://api.soundcloud.com/tracks/" + url.PathEscape(t.ID)
+		extractor := strings.ToLower(firstNonEmpty(stringField(m, "extractor"), stringField(m, "extractor_key")))
+		if strings.Contains(extractor, "soundcloud") {
+			t.URL = "https://api.soundcloud.com/tracks/" + url.PathEscape(t.ID)
+		}
 	}
 	if t.URL == "" {
 		return Track{}, false
 	}
 	if t.Title == "" {
 		if t.ID != "" {
-			t.Title = "Track " + t.ID
+			t.Title = "Media item " + t.ID
 		} else {
-			t.Title = "Unknown track"
+			t.Title = "Unknown media item"
 		}
 	}
 	return t, true
@@ -339,7 +353,7 @@ func (s *Service) download(req Request) {
 		req.JobID = strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	if len(req.Items) == 0 {
-		s.emit(Event{"event": "download_error", "jobId": req.JobID, "message": "There are no tracks selected."})
+		s.emit(Event{"event": "download_error", "jobId": req.JobID, "message": "There are no media items selected."})
 		return
 	}
 	outputDir := strings.TrimSpace(req.OutputDir)
@@ -367,7 +381,7 @@ func (s *Service) download(req Request) {
 		s.unregisterJob(req.JobID)
 	}()
 
-	s.emit(Event{"event": "download_started", "jobId": req.JobID, "total": len(req.Items), "message": fmt.Sprintf("Downloading %d track(s)…", len(req.Items))})
+	s.emit(Event{"event": "download_started", "jobId": req.JobID, "total": len(req.Items), "message": fmt.Sprintf("Downloading %d media item(s)…", len(req.Items))})
 	jobs := make(chan Track)
 	var wg sync.WaitGroup
 	var resultMu sync.Mutex
@@ -383,14 +397,14 @@ func (s *Service) download(req Request) {
 					resultMu.Unlock()
 					continue
 				}
-				if err := validateSoundCloudURL(track.URL); err != nil {
+				if err := validateMediaURL(track.URL); err != nil {
 					resultMu.Lock()
 					failed++
 					resultMu.Unlock()
 					s.emit(Event{"event": "track_error", "jobId": req.JobID, "trackId": track.ID, "title": track.Title, "message": err.Error()})
 					continue
 				}
-				if s.downloadOne(ctx, req.JobID, track, outputDir, req.Quality, proxy) {
+				if s.downloadOne(ctx, req, track, outputDir, proxy) {
 					resultMu.Lock()
 					completed++
 					resultMu.Unlock()
@@ -424,24 +438,75 @@ sendLoop:
 	s.emit(Event{"event": "download_finished", "jobId": req.JobID, "completed": c, "failed": f, "cancelled": x, "total": len(req.Items)})
 }
 
-func (s *Service) downloadOne(ctx context.Context, jobID string, track Track, outputDir, quality string, proxy []string) bool {
+func (s *Service) downloadOne(ctx context.Context, req Request, track Track, outputDir string, proxy []string) bool {
+	jobID := req.JobID
+	mode := strings.ToLower(strings.TrimSpace(req.MediaMode))
+	if mode == "" {
+		mode = "audio"
+	}
+	if mode != "audio" && mode != "video" && mode != "both" {
+		s.emit(Event{"event": "track_error", "jobId": jobID, "trackId": track.ID, "title": track.Title, "message": "Unsupported media mode; choose audio, video or both."})
+		return false
+	}
+	embedThumbnail := true
+	if req.EmbedThumbnail != nil {
+		embedThumbnail = *req.EmbedThumbnail
+	}
+	audioQuality := firstNonEmpty(req.AudioQuality, req.Quality, "source")
+	videoQuality := firstNonEmpty(req.VideoQuality, "best")
+	s.emit(Event{"event": "track_started", "jobId": jobID, "trackId": track.ID, "title": track.Title, "artist": track.Artist, "mediaMode": mode})
+
+	videoOK, audioOK := true, true
+	switch mode {
+	case "audio":
+		audioOK = s.downloadMedia(ctx, jobID, track, outputDir, "audio", audioQuality, "", embedThumbnail, false, proxy)
+	case "video":
+		videoOK = s.downloadMedia(ctx, jobID, track, outputDir, "video", videoQuality, "", embedThumbnail, req.EmbedSubtitles, proxy)
+	case "both":
+		// Download video and a separate audio-only file. The output suffixes
+		// avoid collisions while sharing one queue item and cancellation context.
+		videoOK = s.downloadMedia(ctx, jobID, track, outputDir, "video", videoQuality, " (video)", embedThumbnail, req.EmbedSubtitles, proxy)
+		if ctx.Err() == nil {
+			audioOK = s.downloadMedia(ctx, jobID, track, outputDir, "audio", audioQuality, " (audio)", embedThumbnail, false, proxy)
+		} else {
+			audioOK = false
+		}
+	}
+	return videoOK && audioOK
+}
+
+func (s *Service) downloadMedia(ctx context.Context, jobID string, track Track, outputDir, mediaType, quality, outputSuffix string, embedThumbnail, embedSubtitles bool, proxy []string) bool {
+	outputTemplate := filepath.Join(outputDir, "%(artist,uploader,creator)s - %(title)s [%(id)s]"+outputSuffix+".%(ext)s")
 	args := []string{
 		"--no-warnings", "--no-call-home", "--newline", "--no-color", "--no-playlist",
 		"--socket-timeout", "20", "--retries", "3", "--fragment-retries", "3", "--extractor-retries", "3", "--file-access-retries", "2",
+		"--concurrent-fragments", "4",
 		"--progress", "--progress-delta", "1",
 		"--progress-template", "download:SF_PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
 		"--print", "after_move:SF_DONE:%(filepath)s",
-		"--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg",
-		"--output", filepath.Join(outputDir, "%(artist,uploader,creator)s - %(title)s [%(id)s].%(ext)s"),
+		"--embed-metadata",
+		"--output", outputTemplate,
 	}
-	quality = strings.ToLower(strings.TrimSpace(quality))
-	switch quality {
-	case "mp3-320", "mp3-256", "mp3-192", "mp3-128":
-		bitrate := strings.TrimPrefix(quality, "mp3-") + "K"
-		args = append(args, "--extract-audio", "--audio-format", "mp3", "--audio-quality", bitrate)
-	default:
-		// Preserve the best source stream instead of re-encoding it.
-		args = append(args, "--format", "bestaudio/best", "--extract-audio", "--audio-format", "best")
+	if embedThumbnail {
+		args = append(args, "--embed-thumbnail", "--convert-thumbnails", "jpg")
+	}
+
+	if mediaType == "audio" {
+		args = append(args, "--format", "bestaudio/best", "--extract-audio")
+		switch normalizeAudioQuality(quality) {
+		case "source":
+			args = append(args, "--audio-format", "best")
+		case "mp3-320", "mp3-256", "mp3-192", "mp3-128":
+			bitrate := strings.TrimPrefix(normalizeAudioQuality(quality), "mp3-") + "K"
+			args = append(args, "--audio-format", "mp3", "--audio-quality", bitrate)
+		}
+	} else {
+		args = append(args, "--format", videoFormat(quality))
+		if embedSubtitles {
+			// yt-dlp can embed available subtitles into supported video containers
+			// through FFmpeg; it does not require an additional Go/C++ dependency.
+			args = append(args, "--embed-subs", "--sub-langs", "all")
+		}
 	}
 	args = append(args, proxy...)
 	args = append(args, track.URL)
@@ -461,29 +526,56 @@ func (s *Service) downloadOne(ctx context.Context, jobID string, track Track, ou
 			if len(parts) > 2 {
 				eta = strings.TrimSpace(parts[2])
 			}
-			s.emit(Event{"event": "progress", "jobId": jobID, "trackId": track.ID, "title": track.Title, "percent": percent, "speed": speed, "eta": eta})
+			s.emit(Event{"event": "progress", "jobId": jobID, "trackId": track.ID, "title": track.Title, "mediaType": mediaType, "percent": percent, "speed": speed, "eta": eta})
 		} else if strings.HasPrefix(line, "SF_DONE:") {
-			s.emit(Event{"event": "track_saved", "jobId": jobID, "trackId": track.ID, "title": track.Title, "path": strings.TrimSpace(strings.TrimPrefix(line, "SF_DONE:"))})
+			s.emit(Event{"event": "track_saved", "jobId": jobID, "trackId": track.ID, "title": track.Title, "mediaType": mediaType, "path": strings.TrimSpace(strings.TrimPrefix(line, "SF_DONE:"))})
 		}
 	}}
 	cmd.Stdout = writer
 	cmd.Stderr = writer
-	s.emit(Event{"event": "track_started", "jobId": jobID, "trackId": track.ID, "title": track.Title, "artist": track.Artist})
 	err := cmd.Run()
 	writer.Flush()
 	if err != nil {
 		if ctx.Err() != nil {
-			s.emit(Event{"event": "track_cancelled", "jobId": jobID, "trackId": track.ID, "title": track.Title})
+			s.emit(Event{"event": "track_cancelled", "jobId": jobID, "trackId": track.ID, "title": track.Title, "mediaType": mediaType})
 			return false
 		}
 		message := writer.Tail()
 		if message == "" {
 			message = err.Error()
 		}
-		s.emit(Event{"event": "track_error", "jobId": jobID, "trackId": track.ID, "title": track.Title, "message": concise(message)})
+		s.emit(Event{"event": "track_error", "jobId": jobID, "trackId": track.ID, "title": track.Title, "mediaType": mediaType, "message": concise(message)})
 		return false
 	}
 	return true
+}
+
+func normalizeAudioQuality(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "mp3-320", "mp3-256", "mp3-192", "mp3-128":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "source"
+	}
+}
+
+func videoFormat(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "2160p":
+		return "bv*[height<=2160]+ba/b[height<=2160]"
+	case "1440p":
+		return "bv*[height<=1440]+ba/b[height<=1440]"
+	case "1080p":
+		return "bv*[height<=1080]+ba/b[height<=1080]"
+	case "720p":
+		return "bv*[height<=720]+ba/b[height<=720]"
+	case "480p":
+		return "bv*[height<=480]+ba/b[height<=480]"
+	case "360p":
+		return "bv*[height<=360]+ba/b[height<=360]"
+	default:
+		return "bv*+ba/b"
+	}
 }
 
 // lineWriter safely merges yt-dlp stdout/stderr, emitting complete progress lines.
