@@ -185,7 +185,11 @@ func (s *Service) fetch(req Request) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	args := []string{"--dump-single-json", "--no-warnings", "--no-call-home", "--socket-timeout", "20", "--skip-download", "--flat-playlist", "--yes-playlist", "--no-progress"}
+	// Do not use --flat-playlist here: SoundCloud's flat entries can omit
+	// title/uploader/thumbnail metadata. Full playlist extraction resolves the
+	// track fields once so the UI and download queue do not fall back to
+	// "Untitled track". It still skips media downloads and only returns JSON.
+	args := []string{"--dump-single-json", "--no-warnings", "--no-call-home", "--socket-timeout", "20", "--skip-download", "--yes-playlist", "--no-progress"}
 	args = append(args, proxy...)
 	args = append(args, req.URL)
 	cmd := exec.CommandContext(ctx, s.ytdlp, args...)
@@ -242,9 +246,9 @@ func (s *Service) fetch(req Request) {
 func trackFromMap(m map[string]any) (Track, bool) {
 	t := Track{
 		ID:        stringField(m, "id"),
-		Title:     firstNonEmpty(stringField(m, "title"), stringField(m, "fulltitle"), "Untitled track"),
+		Title:     firstNonEmpty(stringField(m, "title"), stringField(m, "fulltitle"), stringField(m, "alt_title")),
 		Artist:    firstNonEmpty(stringField(m, "artist"), firstString(m["artists"]), stringField(m, "creator"), stringField(m, "uploader"), stringField(m, "channel")),
-		Thumbnail: stringField(m, "thumbnail"),
+		Thumbnail: firstNonEmpty(stringField(m, "thumbnail"), firstThumbnail(m["thumbnails"])),
 	}
 	if value, ok := m["duration"].(float64); ok {
 		t.Duration = value
@@ -262,6 +266,13 @@ func trackFromMap(m map[string]any) (Track, bool) {
 	if t.URL == "" {
 		return Track{}, false
 	}
+	if t.Title == "" {
+		if t.ID != "" {
+			t.Title = "Track " + t.ID
+		} else {
+			t.Title = "Unknown track"
+		}
+	}
 	return t, true
 }
 
@@ -273,9 +284,34 @@ func stringField(m map[string]any, key string) string {
 func firstString(value any) string {
 	if values, ok := value.([]any); ok {
 		for _, item := range values {
-			if candidate, ok := item.(string); ok && strings.TrimSpace(candidate) != "" {
-				return strings.TrimSpace(candidate)
+			switch candidate := item.(type) {
+			case string:
+				if strings.TrimSpace(candidate) != "" {
+					return strings.TrimSpace(candidate)
+				}
+			case map[string]any:
+				if name := firstNonEmpty(stringField(candidate, "name"), stringField(candidate, "username")); name != "" {
+					return name
+				}
 			}
+		}
+	}
+	return ""
+}
+
+func firstThumbnail(value any) string {
+	values, ok := value.([]any)
+	if !ok {
+		return ""
+	}
+	// yt-dlp generally orders thumbnails from lower to higher resolution.
+	for i := len(values) - 1; i >= 0; i-- {
+		item, ok := values[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		if thumbnail := stringField(item, "url"); thumbnail != "" {
+			return thumbnail
 		}
 	}
 	return ""
