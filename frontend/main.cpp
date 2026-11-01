@@ -16,6 +16,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -42,11 +43,14 @@ using json = nlohmann::json;
 namespace {
 constexpr int kWindowWidth = 1020;
 constexpr int kWindowHeight = 760;
-const Fl_Color kBackground = fl_rgb_color(20, 21, 25);
-const Fl_Color kPanel = fl_rgb_color(29, 31, 37);
-const Fl_Color kText = fl_rgb_color(235, 237, 242);
-const Fl_Color kMuted = fl_rgb_color(157, 163, 174);
-const Fl_Color kAccent = fl_rgb_color(255, 85, 35);
+Fl_Color kBackground = fl_rgb_color(20, 21, 25);
+Fl_Color kPanel = fl_rgb_color(29, 31, 37);
+Fl_Color kRowAlt = fl_rgb_color(33, 35, 42);
+Fl_Color kText = fl_rgb_color(235, 237, 242);
+Fl_Color kMuted = fl_rgb_color(157, 163, 174);
+Fl_Color kAccent = fl_rgb_color(255, 85, 35);
+Fl_Color kButton = fl_rgb_color(48, 51, 60);
+Fl_Color kButtonText = FL_WHITE;
 
 std::string trim(std::string value) {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -67,6 +71,57 @@ std::string defaultMusicDirectory() {
     if (const char* home = std::getenv("HOME"); home && *home)
         return (fs::path(home) / "Music" / "SoundFetch").string();
     return (fs::current_path() / "SoundFetch").string();
+}
+
+std::string lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+bool fileSuggestsDarkTheme(const fs::path& path) {
+    std::ifstream input(path);
+    if (!input) return false;
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::string value = lower(trim(line));
+        if (value == "gtk-application-prefer-dark-theme=true" ||
+            value == "gtk-application-prefer-dark-theme=1" ||
+            value == "color-scheme=prefer-dark" ||
+            value == "color-scheme=dark") return true;
+        if ((value.rfind("gtk-theme-name=", 0) == 0 || value.rfind("colorscheme=", 0) == 0) &&
+            value.find("dark") != std::string::npos) return true;
+    }
+    return false;
+}
+
+bool detectSystemDarkTheme() {
+    if (const char* theme = std::getenv("GTK_THEME"); theme && lower(theme).find("dark") != std::string::npos)
+        return true;
+
+    // GNOME exposes its preference through gsettings. This is optional and
+    // queried only when present; SoundFetch does not link to GLib/GSettings.
+    if (FILE* pipe = ::popen("gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null", "r")) {
+        char buffer[128] = {};
+        const bool read = std::fgets(buffer, sizeof(buffer), pipe) != nullptr;
+        const int status = ::pclose(pipe);
+        if (read && status == 0) {
+            const std::string value = lower(buffer);
+            if (value.find("prefer-dark") != std::string::npos || value.find("dark") != std::string::npos)
+                return true;
+            if (value.find("default") != std::string::npos || value.find("prefer-light") != std::string::npos)
+                return false;
+        }
+    }
+
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        const fs::path config(home);
+        if (fileSuggestsDarkTheme(config / ".config/gtk-4.0/settings.ini") ||
+            fileSuggestsDarkTheme(config / ".config/gtk-3.0/settings.ini") ||
+            fileSuggestsDarkTheme(config / ".config/kdeglobals")) return true;
+    }
+    return false;
 }
 
 std::string durationText(double seconds) {
@@ -236,7 +291,7 @@ public:
             log("Could not start the Go backend. Check that soundfetch-backend is installed beside the GUI.");
             status_->label("Backend failed to start");
         } else {
-            log("Ready. Paste a public SoundCloud track or playlist URL.");
+            log("Ready. Paste a URL supported by yt-dlp.");
         }
         Fl::add_timeout(0.10, timerCallback, this);
     }
@@ -281,13 +336,16 @@ private:
     static void saveSettingsCallback(Fl_Widget*, void* data) {
         static_cast<SoundFetchApp*>(data)->saveSettingsFromUI();
     }
+    static void themeChangedCallback(Fl_Widget*, void* data) {
+        static_cast<SoundFetchApp*>(data)->themeChanged();
+    }
+    static void optionChangedCallback(Fl_Widget*, void* data) {
+        static_cast<SoundFetchApp*>(data)->optionsChanged();
+    }
 
     void buildUI() {
         Fl::scheme("gtk+");
-        Fl::background(20, 21, 25);
-        Fl::background2(34, 36, 43);
-        Fl::foreground(235, 237, 242);
-        Fl::set_color(FL_SELECTION_COLOR, kAccent);
+        applyTheme();
 
         window_ = new Fl_Window(kWindowWidth, kWindowHeight, "SoundFetch");
         window_->color(kBackground);
@@ -299,7 +357,7 @@ private:
         brand->labelsize(25);
         brand->labelcolor(kAccent);
 
-        auto* tagline = new Fl_Box(385, 20, 570, 30, "A lightweight SoundCloud downloader");
+        auto* tagline = new Fl_Box(385, 20, 570, 30, "A lightweight yt-dlp desktop client");
         tagline->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
         tagline->labelcolor(kMuted);
         tagline->labelsize(14);
@@ -312,29 +370,26 @@ private:
         mainTab_->color(kBackground);
         mainTab_->begin();
 
-        auto* linkLabel = new Fl_Box(40, 112, 300, 24, "PASTE SOUNDCLOUD LINK");
+        auto* linkLabel = new Fl_Box(40, 112, 300, 24, "PASTE MEDIA LINK");
         leftLabel(linkLabel);
         urlInput_ = new Fl_Input(40, 139, 760, 38);
-        urlInput_->tooltip("A public SoundCloud track, playlist, album or artist tracks URL");
+        urlInput_->tooltip("Any HTTP(S) URL supported by yt-dlp, including playlists and channels");
         styleInput(urlInput_);
-        fetchButton_ = new Fl_Button(814, 139, 164, 38, "Fetch tracks");
+        fetchButton_ = new Fl_Button(814, 139, 164, 38, "Fetch media");
         styleButton(fetchButton_, true);
         fetchButton_->callback(fetchCallback, this);
 
-        auto* qualityLabel = new Fl_Box(40, 192, 300, 22, "AUDIO QUALITY");
-        leftLabel(qualityLabel);
-        qualityChoice_ = new Fl_Choice(40, 218, 300, 36);
-        qualityChoice_->add("Best available (keep source)");
-        qualityChoice_->add("MP3 - 320 kbps");
-        qualityChoice_->add("MP3 - 256 kbps");
-        qualityChoice_->add("MP3 - 192 kbps");
-        qualityChoice_->add("MP3 - 128 kbps");
-        qualityChoice_->value(0);
-        styleChoice(qualityChoice_);
+        auto* optionsLabel = new Fl_Box(40, 192, 300, 22, "MEDIA OPTIONS");
+        leftLabel(optionsLabel);
+        auto* optionsHint = new Fl_Box(40, 218, 760, 36,
+            "Choose audio / video mode, quality and embedding options in the Other tab.");
+        optionsHint->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+        optionsHint->labelcolor(kMuted);
+        optionsHint->labelsize(13);
 
-        auto* listTitle = new Fl_Box(40, 270, 550, 24, "TRACKS");
+        auto* listTitle = new Fl_Box(40, 270, 550, 24, "MEDIA ITEMS");
         leftLabel(listTitle);
-        trackCount_ = new Fl_Box(740, 270, 238, 24, "No tracks loaded");
+        trackCount_ = new Fl_Box(740, 270, 238, 24, "No media loaded");
         trackCount_->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
         trackCount_->labelcolor(kMuted);
         trackCount_->labelsize(12);
@@ -343,7 +398,7 @@ private:
         listScroll_->box(FL_DOWN_FRAME);
         listScroll_->color(kPanel);
         listScroll_->begin();
-        auto* empty = new Fl_Box(56, 309, 900, 32, "Paste a SoundCloud link and select Fetch tracks.");
+        auto* empty = new Fl_Box(56, 309, 900, 32, "Paste a media URL and select Fetch media.");
         empty->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
         empty->labelcolor(kMuted);
         empty->labelsize(13);
@@ -418,8 +473,8 @@ private:
         browseButton_->callback(browseCallback, this);
 
         auto* note = new Fl_Box(40, 382, 900, 68,
-            "SoundFetch uses yt-dlp for SoundCloud extraction and FFmpeg for tagging / format conversion.\n"
-            "Proxy settings affect network requests only; they do not unlock private, blocked or paid tracks.");
+            "SoundFetch uses yt-dlp for supported sites and FFmpeg for conversion / media embedding.\n"
+            "Proxy settings affect routing only; they do not unlock private, blocked or paid content.");
         note->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_TOP);
         note->labelcolor(kMuted);
         note->labelsize(13);
@@ -429,8 +484,99 @@ private:
         saveSettingsButton_->callback(saveSettingsCallback, this);
         settingsTab_->end();
 
+        preferenceTab_ = new Fl_Group(18, 91, kWindowWidth - 36, kWindowHeight - 112, "Preference");
+        preferenceTab_->color(kBackground);
+        preferenceTab_->begin();
+        auto* preferenceTitle = new Fl_Box(40, 112, 500, 28, "APPEARANCE");
+        preferenceTitle->labelfont(FL_BOLD);
+        preferenceTitle->labelsize(17);
+        preferenceTitle->labelcolor(kText);
+        preferenceTitle->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+        auto* themeLabel = new Fl_Box(40, 163, 260, 22, "COLOR MODE");
+        leftLabel(themeLabel);
+        themeChoice_ = new Fl_Choice(40, 190, 330, 38);
+        themeChoice_->add("Automatic (system preference)");
+        themeChoice_->add("Light");
+        themeChoice_->add("Dark");
+        themeChoice_->value(themeMode_ == "light" ? 1 : (themeMode_ == "dark" ? 2 : 0));
+        styleChoice(themeChoice_);
+        themeChoice_->callback(themeChangedCallback, this);
+        auto* themeNote = new Fl_Box(40, 248, 880, 64,
+            "Automatic checks the desktop preference on launch (GNOME / GTK / KDE), then uses a light fallback.\n"
+            "Light and dark modes recolor the whole interface immediately.");
+        themeNote->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_TOP);
+        themeNote->labelcolor(kMuted);
+        themeNote->labelsize(13);
+        preferenceTab_->end();
+
+        otherTab_ = new Fl_Group(18, 91, kWindowWidth - 36, kWindowHeight - 112, "Other");
+        otherTab_->color(kBackground);
+        otherTab_->begin();
+        auto* otherTitle = new Fl_Box(40, 112, 500, 28, "YT-DLP MEDIA OPTIONS");
+        otherTitle->labelfont(FL_BOLD);
+        otherTitle->labelsize(17);
+        otherTitle->labelcolor(kText);
+        otherTitle->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+
+        auto* modeLabel = new Fl_Box(40, 163, 300, 22, "DOWNLOAD TYPE");
+        leftLabel(modeLabel);
+        mediaModeChoice_ = new Fl_Choice(40, 190, 360, 38);
+        mediaModeChoice_->add("Audio only");
+        mediaModeChoice_->add("Video only");
+        mediaModeChoice_->add("Both (video + separate audio)");
+        mediaModeChoice_->value(mediaMode_ == "video" ? 1 : (mediaMode_ == "both" ? 2 : 0));
+        styleChoice(mediaModeChoice_);
+        mediaModeChoice_->callback(optionChangedCallback, this);
+
+        auto* audioLabel = new Fl_Box(40, 252, 300, 22, "AUDIO QUALITY");
+        leftLabel(audioLabel);
+        audioQualityChoice_ = new Fl_Choice(40, 279, 360, 38);
+        audioQualityChoice_->add("Best available (keep source)");
+        audioQualityChoice_->add("MP3 - 320 kbps");
+        audioQualityChoice_->add("MP3 - 256 kbps");
+        audioQualityChoice_->add("MP3 - 192 kbps");
+        audioQualityChoice_->add("MP3 - 128 kbps");
+        audioQualityChoice_->value(audioQuality_ == "mp3-320" ? 1 : audioQuality_ == "mp3-256" ? 2 : audioQuality_ == "mp3-192" ? 3 : audioQuality_ == "mp3-128" ? 4 : 0);
+        styleChoice(audioQualityChoice_);
+        audioQualityChoice_->callback(optionChangedCallback, this);
+
+        auto* videoLabel = new Fl_Box(450, 252, 300, 22, "VIDEO QUALITY");
+        leftLabel(videoLabel);
+        videoQualityChoice_ = new Fl_Choice(450, 279, 360, 38);
+        videoQualityChoice_->add("Best available");
+        videoQualityChoice_->add("Up to 2160p (4K)");
+        videoQualityChoice_->add("Up to 1440p");
+        videoQualityChoice_->add("Up to 1080p");
+        videoQualityChoice_->add("Up to 720p");
+        videoQualityChoice_->add("Up to 480p");
+        videoQualityChoice_->add("Up to 360p");
+        videoQualityChoice_->value(videoQuality_ == "2160p" ? 1 : videoQuality_ == "1440p" ? 2 : videoQuality_ == "1080p" ? 3 : videoQuality_ == "720p" ? 4 : videoQuality_ == "480p" ? 5 : videoQuality_ == "360p" ? 6 : 0);
+        styleChoice(videoQualityChoice_);
+        videoQualityChoice_->callback(optionChangedCallback, this);
+
+        embedThumbnailToggle_ = new Fl_Check_Button(40, 354, 420, 30, "Embed cover artwork when supported");
+        embedThumbnailToggle_->labelcolor(kText);
+        embedThumbnailToggle_->labelsize(14);
+        embedThumbnailToggle_->value(embedThumbnail_ ? 1 : 0);
+        embedThumbnailToggle_->callback(optionChangedCallback, this);
+        embedSubtitlesToggle_ = new Fl_Check_Button(40, 396, 420, 30, "Embed available subtitles in video");
+        embedSubtitlesToggle_->labelcolor(kText);
+        embedSubtitlesToggle_->labelsize(14);
+        embedSubtitlesToggle_->value(embedSubtitles_ ? 1 : 0);
+        embedSubtitlesToggle_->callback(optionChangedCallback, this);
+        auto* optimizationNote = new Fl_Box(40, 455, 900, 100,
+            "Powered by yt-dlp with a small Go coordinator. SoundFetch uses bounded parallel downloads,\n"
+            "fragment concurrency and streamed progress updates. Audio and video are downloaded separately\n"
+            "when Both is selected. Subtitle embedding requires subtitles to be available and FFmpeg support.");
+        optimizationNote->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_TOP);
+        optimizationNote->labelcolor(kMuted);
+        optimizationNote->labelsize(13);
+        otherTab_->end();
+
         tabs_->end();
         window_->end();
+        applyTheme();
+        updateSubtitleAvailability();
         window_->resizable(tabs_);
         mainTab_->resizable(listScroll_);
         window_->size_range(850, 650);
@@ -458,9 +604,9 @@ private:
     }
 
     static void styleButton(Fl_Button* button, bool primary) {
-        button->color(primary ? kAccent : fl_rgb_color(48, 51, 60));
+        button->color(primary ? kAccent : kButton);
         button->selection_color(primary ? fl_rgb_color(225, 70, 25) : fl_rgb_color(67, 71, 82));
-        button->labelcolor(FL_WHITE);
+        button->labelcolor(kButtonText);
         button->labelfont(FL_BOLD);
         button->labelsize(13);
         button->box(FL_ROUND_UP_BOX);
@@ -476,31 +622,192 @@ private:
             outputDir_ = settings.value("outputDir", outputDir_);
             proxyEnabled_ = settings.value("proxyEnabled", false);
             proxyURL_ = settings.value("proxyUrl", std::string{});
+            themeMode_ = settings.value("theme", std::string{"auto"});
+            mediaMode_ = settings.value("mediaMode", std::string{"audio"});
+            audioQuality_ = settings.value("audioQuality", settings.value("quality", std::string{"source"}));
+            videoQuality_ = settings.value("videoQuality", std::string{"best"});
+            embedThumbnail_ = settings.value("embedThumbnail", true);
+            embedSubtitles_ = settings.value("embedSubtitles", false);
         } catch (...) {
             // Keep defaults when an old or incomplete settings file cannot be read.
         }
+        if (themeMode_ != "light" && themeMode_ != "dark") themeMode_ = "auto";
+        if (mediaMode_ != "audio" && mediaMode_ != "video" && mediaMode_ != "both") mediaMode_ = "audio";
     }
 
-    void saveSettingsFromUI() {
-        proxyEnabled_ = proxyToggle_->value() != 0;
-        proxyURL_ = trim(proxyInput_->value());
-        outputDir_ = trim(pathInput_->value());
+    void collectSettingsFromUI() {
+        if (proxyToggle_) proxyEnabled_ = proxyToggle_->value() != 0;
+        if (proxyInput_) proxyURL_ = trim(proxyInput_->value());
+        if (pathInput_) outputDir_ = trim(pathInput_->value());
         if (outputDir_.empty()) outputDir_ = defaultMusicDirectory();
+        if (themeChoice_) themeMode_ = themeChoice_->value() == 1 ? "light" : (themeChoice_->value() == 2 ? "dark" : "auto");
+        if (mediaModeChoice_) mediaMode_ = mediaModeChoice_->value() == 1 ? "video" : (mediaModeChoice_->value() == 2 ? "both" : "audio");
+        if (audioQualityChoice_) {
+            switch (audioQualityChoice_->value()) {
+                case 1: audioQuality_ = "mp3-320"; break;
+                case 2: audioQuality_ = "mp3-256"; break;
+                case 3: audioQuality_ = "mp3-192"; break;
+                case 4: audioQuality_ = "mp3-128"; break;
+                default: audioQuality_ = "source"; break;
+            }
+        }
+        if (videoQualityChoice_) {
+            switch (videoQualityChoice_->value()) {
+                case 1: videoQuality_ = "2160p"; break;
+                case 2: videoQuality_ = "1440p"; break;
+                case 3: videoQuality_ = "1080p"; break;
+                case 4: videoQuality_ = "720p"; break;
+                case 5: videoQuality_ = "480p"; break;
+                case 6: videoQuality_ = "360p"; break;
+                default: videoQuality_ = "best"; break;
+            }
+        }
+        if (embedThumbnailToggle_) embedThumbnail_ = embedThumbnailToggle_->value() != 0;
+        if (embedSubtitlesToggle_) embedSubtitles_ = embedSubtitlesToggle_->value() != 0;
+    }
+
+    void writeSettings(bool announce) {
+        collectSettingsFromUI();
         std::error_code ec;
         fs::create_directories(configPath_.parent_path(), ec);
         if (!ec) fs::permissions(configPath_.parent_path(), fs::perms::owner_all, fs::perm_options::replace, ec);
         std::ofstream output(configPath_);
         if (!output) {
-            log("Could not write settings file: " + configPath_.string());
+            if (announce) log("Could not write settings file: " + configPath_.string());
             return;
         }
-        output << json{{"outputDir", outputDir_}, {"proxyEnabled", proxyEnabled_}, {"proxyUrl", proxyURL_}}.dump(2);
+        output << json{
+            {"outputDir", outputDir_}, {"proxyEnabled", proxyEnabled_}, {"proxyUrl", proxyURL_},
+            {"theme", themeMode_}, {"mediaMode", mediaMode_}, {"audioQuality", audioQuality_},
+            {"videoQuality", videoQuality_}, {"embedThumbnail", embedThumbnail_}, {"embedSubtitles", embedSubtitles_}
+        }.dump(2);
         output.flush();
         output.close();
         fs::permissions(configPath_, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
-        pathInput_->value(outputDir_.c_str());
-        log("Settings saved.");
-        status_->label("Settings saved");
+        if (pathInput_) pathInput_->value(outputDir_.c_str());
+        if (announce) {
+            log("Settings saved.");
+            status_->label("Settings saved");
+        }
+    }
+
+    void saveSettingsFromUI() {
+        writeSettings(true);
+    }
+
+    void themeChanged() {
+        collectSettingsFromUI();
+        applyTheme();
+        writeSettings(false);
+    }
+
+    void optionsChanged() {
+        collectSettingsFromUI();
+        updateSubtitleAvailability();
+        writeSettings(false);
+    }
+
+    void updateSubtitleAvailability() {
+        if (!embedSubtitlesToggle_ || !mediaModeChoice_) return;
+        if (mediaModeChoice_->value() == 0) {
+            embedSubtitlesToggle_->deactivate();
+        } else {
+            embedSubtitlesToggle_->activate();
+        }
+    }
+
+    void applyTheme() {
+        const Fl_Color oldBackground = kBackground;
+        const Fl_Color oldPanel = kPanel;
+        const Fl_Color oldRowAlt = kRowAlt;
+        const Fl_Color oldText = kText;
+        const Fl_Color oldMuted = kMuted;
+        const Fl_Color oldAccent = kAccent;
+        const Fl_Color oldButton = kButton;
+
+        const bool dark = themeMode_ == "dark" || (themeMode_ == "auto" && detectSystemDarkTheme());
+        if (dark) {
+            kBackground = fl_rgb_color(20, 21, 25);
+            kPanel = fl_rgb_color(29, 31, 37);
+            kRowAlt = fl_rgb_color(33, 35, 42);
+            kText = fl_rgb_color(235, 237, 242);
+            kMuted = fl_rgb_color(157, 163, 174);
+            kAccent = fl_rgb_color(255, 85, 35);
+            kButton = fl_rgb_color(48, 51, 60);
+            kButtonText = FL_WHITE;
+        } else {
+            kBackground = fl_rgb_color(246, 247, 249);
+            kPanel = fl_rgb_color(255, 255, 255);
+            kRowAlt = fl_rgb_color(238, 240, 244);
+            kText = fl_rgb_color(34, 37, 43);
+            kMuted = fl_rgb_color(103, 110, 121);
+            kAccent = fl_rgb_color(224, 76, 35);
+            kButton = fl_rgb_color(226, 229, 234);
+            kButtonText = fl_rgb_color(34, 37, 43);
+        }
+        uchar red = 0, green = 0, blue = 0;
+        Fl::get_color(kBackground, red, green, blue);
+        Fl::background(red, green, blue);
+        Fl::get_color(kPanel, red, green, blue);
+        Fl::background2(red, green, blue);
+        Fl::get_color(kText, red, green, blue);
+        Fl::foreground(red, green, blue);
+        Fl::set_color(FL_SELECTION_COLOR, kAccent);
+
+        if (window_) recolorWidgetTree(window_, oldBackground, oldPanel, oldRowAlt, oldText, oldMuted, oldAccent, oldButton);
+        if (window_) window_->redraw();
+    }
+
+    void recolorWidgetTree(Fl_Widget* widget, Fl_Color oldBackground, Fl_Color oldPanel, Fl_Color oldRowAlt,
+                           Fl_Color oldText, Fl_Color oldMuted, Fl_Color oldAccent, Fl_Color oldButton) {
+        auto remapLabel = [&](Fl_Color color) {
+            if (color == oldText) return kText;
+            if (color == oldMuted) return kMuted;
+            if (color == oldAccent) return kAccent;
+            return color;
+        };
+        if (auto* display = dynamic_cast<Fl_Text_Display*>(widget)) {
+            display->color(kPanel);
+            display->textcolor(kText);
+        } else if (auto* progress = dynamic_cast<Fl_Progress*>(widget)) {
+            progress->color(kPanel);
+            progress->selection_color(kAccent);
+        } else if (auto* scroll = dynamic_cast<Fl_Scroll*>(widget)) {
+            scroll->color(kPanel);
+        } else if (auto* check = dynamic_cast<Fl_Check_Button*>(widget)) {
+            check->color(kPanel);
+            check->labelcolor(kText);
+        } else if (auto* input = dynamic_cast<Fl_Input*>(widget)) {
+            input->color(kPanel);
+            input->selection_color(kAccent);
+            input->textcolor(kText);
+            input->labelcolor(kText);
+        } else if (auto* choice = dynamic_cast<Fl_Choice*>(widget)) {
+            choice->color(kPanel);
+            choice->selection_color(kAccent);
+            choice->textcolor(kText);
+            choice->labelcolor(kText);
+        } else if (auto* button = dynamic_cast<Fl_Button*>(widget)) {
+            const bool primary = button->color() == oldAccent;
+            styleButton(button, primary);
+        } else if (auto* box = dynamic_cast<Fl_Box*>(widget)) {
+            if (box->color() == oldBackground || box->color() == FL_BACKGROUND_COLOR) box->color(kBackground);
+            else if (box->color() == oldPanel) box->color(kPanel);
+            else if (box->color() == oldRowAlt) box->color(kRowAlt);
+            box->labelcolor(remapLabel(box->labelcolor()));
+        } else if (auto* tabs = dynamic_cast<Fl_Tabs*>(widget)) {
+            tabs->color(kBackground);
+            tabs->selection_color(kPanel);
+        } else if (auto* group = dynamic_cast<Fl_Group*>(widget)) {
+            group->color(kBackground);
+        } else if (auto* win = dynamic_cast<Fl_Window*>(widget)) {
+            win->color(kBackground);
+        }
+        if (auto* group = dynamic_cast<Fl_Group*>(widget)) {
+            for (int i = 0; i < group->children(); ++i)
+                recolorWidgetTree(group->child(i), oldBackground, oldPanel, oldRowAlt, oldText, oldMuted, oldAccent, oldButton);
+        }
+        (void)oldButton;
     }
 
     void browseFolder() {
@@ -513,10 +820,7 @@ private:
     }
 
     json settingsPayload() {
-        proxyEnabled_ = proxyToggle_->value() != 0;
-        proxyURL_ = trim(proxyInput_->value());
-        outputDir_ = trim(pathInput_->value());
-        if (outputDir_.empty()) outputDir_ = defaultMusicDirectory();
+        collectSettingsFromUI();
         return {{"proxyEnabled", proxyEnabled_}, {"proxyUrl", proxyURL_}, {"outputDir", outputDir_}};
     }
 
@@ -527,7 +831,7 @@ private:
         }
         const std::string url = trim(urlInput_->value());
         if (url.empty()) {
-            status_->label("Paste a SoundCloud link first");
+            status_->label("Paste a media URL first");
             return;
         }
         json request = settingsPayload();
@@ -536,8 +840,8 @@ private:
         request["url"] = url;
         currentFetchId_ = request["requestId"].get<std::string>();
         fetchButton_->deactivate();
-        status_->label("Fetching track information…");
-        log("Fetching " + url);
+        status_->label("Fetching media information…");
+        log("Fetching with yt-dlp: " + url);
         if (!backend_->send(request)) {
             fetchButton_->activate();
             log("Could not send the request to the Go backend.");
@@ -551,14 +855,18 @@ private:
             if (all || (track.check && track.check->value())) chosen.push_back(track);
         }
         if (chosen.empty()) {
-            status_->label("Select at least one track to download");
+            status_->label("Select at least one item to download");
             return;
         }
         json request = settingsPayload();
         request["cmd"] = "download";
         activeJobId_ = "job-" + std::to_string(++jobCounter_);
         request["jobId"] = activeJobId_;
-        request["quality"] = selectedQuality();
+        request["mediaMode"] = mediaMode_;
+        request["audioQuality"] = audioQuality_;
+        request["videoQuality"] = videoQuality_;
+        request["embedThumbnail"] = embedThumbnail_;
+        request["embedSubtitles"] = embedSubtitles_;
         request["concurrency"] = 3;
         request["items"] = json::array();
         for (const auto& track : chosen) {
@@ -573,23 +881,13 @@ private:
         selectedButton_->deactivate();
         allButton_->deactivate();
         cancelButton_->activate();
-        status_->copy_label(("Starting " + std::to_string(activeTotal_) + " download(s)…").c_str());
-        log("Download queue started: " + std::to_string(activeTotal_) + " track(s).");
+        status_->copy_label(("Starting " + std::to_string(activeTotal_) + " item download(s)…").c_str());
+        log("Download queue started: " + std::to_string(activeTotal_) + " item(s).");
         if (!backend_->send(request)) {
             selectedButton_->activate();
             allButton_->activate();
             cancelButton_->deactivate();
             log("Could not send the download request.");
-        }
-    }
-
-    std::string selectedQuality() const {
-        switch (qualityChoice_->value()) {
-            case 1: return "mp3-320";
-            case 2: return "mp3-256";
-            case 3: return "mp3-192";
-            case 4: return "mp3-128";
-            default: return "source";
         }
     }
 
@@ -616,7 +914,7 @@ private:
             track.url = entry.value("url", std::string{});
             track.title = trim(entry.value("title", std::string{}));
             if (track.title.empty()) {
-                track.title = track.id.empty() ? "Unknown track" : "Track " + track.id;
+                track.title = track.id.empty() ? "Unknown media item" : "Media item " + track.id;
             }
             track.artist = trim(entry.value("artist", std::string{}));
             track.thumbnail = entry.value("thumbnail", std::string{});
@@ -637,23 +935,23 @@ private:
             text->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
             text->labelcolor(kText);
             text->labelsize(13);
-            if (tracks_.size() % 2 == 1) text->color(fl_rgb_color(33, 35, 42));
+            if (tracks_.size() % 2 == 1) text->color(kRowAlt);
             listScroll_->add(track.check);
             listScroll_->add(text);
             tracks_.push_back(std::move(track));
             y += 38;
         }
         if (tracks_.empty()) {
-            auto* empty = new Fl_Box(56, 309, 900, 32, "No tracks were returned for this link.");
+            auto* empty = new Fl_Box(56, 309, 900, 32, "No media items were returned for this URL.");
             empty->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
             empty->labelcolor(kMuted);
             listScroll_->add(empty);
         }
         listScroll_->redraw();
-        const std::string title = event.value("title", std::string{"SoundCloud list"});
-        const std::string count = std::to_string(tracks_.size()) + (tracks_.size() == 1 ? " track" : " tracks");
+        const std::string title = event.value("title", std::string{"Media list"});
+        const std::string count = std::to_string(tracks_.size()) + (tracks_.size() == 1 ? " item" : " items");
         trackCount_->copy_label((title + "  ·  " + count).c_str());
-        status_->label("Tracks loaded. Choose quality and download.");
+        status_->label("Media loaded. Review your items and download.");
         fetchButton_->activate();
         log("Loaded " + count + ": " + title);
     }
@@ -705,31 +1003,34 @@ private:
             status_->copy_label(message.c_str());
             log(message);
         } else if (type == "track_started") {
-            const std::string title = event.value("title", std::string{"Unknown track"});
+            const std::string title = event.value("title", std::string{"Unknown media item"});
             const std::string artist = event.value("artist", std::string{});
             const std::string displayName = artist.empty() ? title : title + " — " + artist;
-            status_->copy_label(("Downloading: " + displayName).c_str());
-            log("Downloading: " + displayName);
+            const std::string mode = event.value("mediaMode", std::string{"audio"});
+            status_->copy_label(("Downloading " + mode + ": " + displayName).c_str());
+            log("Downloading " + mode + ": " + displayName);
         } else if (type == "progress") {
             const double percent = std::clamp(event.value("percent", 0.0), 0.0, 100.0);
             progress_->value(static_cast<float>(percent));
-            const std::string title = event.value("title", std::string{"Track"});
+            const std::string title = event.value("title", std::string{"Media item"});
             const std::string speed = event.value("speed", std::string{});
             const std::string eta = event.value("eta", std::string{});
-            std::string label = title + " — " + std::to_string(static_cast<int>(std::round(percent))) + "%";
+            const std::string mediaType = event.value("mediaType", std::string{});
+            std::string label = (mediaType.empty() ? std::string{} : (mediaType == "video" ? "Video · " : "Audio · ")) + title + " — " + std::to_string(static_cast<int>(std::round(percent))) + "%";
             if (!speed.empty() && speed != "NA") label += " · " + speed;
             if (!eta.empty() && eta != "NA") label += " · ETA " + eta;
             status_->copy_label(label.c_str());
         } else if (type == "track_saved") {
-            const std::string title = event.value("title", std::string{"Track"});
+            const std::string title = event.value("title", std::string{"Media item"});
             const std::string path = event.value("path", std::string{});
-            log("Saved: " + title + (path.empty() ? std::string{} : " → " + path));
+            const std::string mediaType = event.value("mediaType", std::string{});
+            log("Saved" + (mediaType.empty() ? std::string{} : " " + mediaType) + ": " + title + (path.empty() ? std::string{} : " → " + path));
         } else if (type == "track_error") {
-            const std::string title = event.value("title", std::string{"Track"});
+            const std::string title = event.value("title", std::string{"Media item"});
             const std::string message = event.value("message", std::string{"Download failed"});
             log("Failed: " + title + " — " + message);
         } else if (type == "track_cancelled") {
-            log("Cancelled: " + event.value("title", std::string{"Track"}));
+            log("Cancelled: " + event.value("title", std::string{"Media item"}));
         } else if (type == "download_finished") {
             const int done = event.value("completed", 0);
             const int failed = event.value("failed", 0);
@@ -757,8 +1058,15 @@ private:
     Fl_Tabs* tabs_ = nullptr;
     Fl_Group* mainTab_ = nullptr;
     Fl_Group* settingsTab_ = nullptr;
+    Fl_Group* preferenceTab_ = nullptr;
+    Fl_Group* otherTab_ = nullptr;
     Fl_Input* urlInput_ = nullptr;
-    Fl_Choice* qualityChoice_ = nullptr;
+    Fl_Choice* themeChoice_ = nullptr;
+    Fl_Choice* mediaModeChoice_ = nullptr;
+    Fl_Choice* audioQualityChoice_ = nullptr;
+    Fl_Choice* videoQualityChoice_ = nullptr;
+    Fl_Check_Button* embedThumbnailToggle_ = nullptr;
+    Fl_Check_Button* embedSubtitlesToggle_ = nullptr;
     Fl_Button* fetchButton_ = nullptr;
     Fl_Button* selectedButton_ = nullptr;
     Fl_Button* allButton_ = nullptr;
@@ -786,6 +1094,12 @@ private:
     std::string currentFetchId_;
     std::string activeJobId_;
     bool proxyEnabled_ = false;
+    std::string themeMode_ = "auto";
+    std::string mediaMode_ = "audio";
+    std::string audioQuality_ = "source";
+    std::string videoQuality_ = "best";
+    bool embedThumbnail_ = true;
+    bool embedSubtitles_ = false;
     int requestCounter_ = 0;
     int jobCounter_ = 0;
     int activeTotal_ = 0;
