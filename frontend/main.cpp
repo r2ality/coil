@@ -5,7 +5,8 @@
 #include <FL/Fl_Choice.H>
 #include <FL/Fl_Group.H>
 #include <FL/Fl_Input.H>
-#include <FL/Fl_Multiline_Output.H>
+#include <FL/Fl_Text_Buffer.H>
+#include <FL/Fl_Text_Display.H>
 #include <FL/Fl_Native_File_Chooser.H>
 #include <FL/Fl_Progress.H>
 #include <FL/Fl_Scroll.H>
@@ -243,6 +244,11 @@ public:
     ~SoundFetchApp() {
         Fl::remove_timeout(timerCallback, this);
         backend_.reset();
+        // The text display references its buffer, so destroy the window first.
+        delete window_;
+        window_ = nullptr;
+        delete logBuffer_;
+        logBuffer_ = nullptr;
     }
 
     int run() {
@@ -367,11 +373,16 @@ private:
         status_->labelcolor(kMuted);
         status_->labelsize(12);
 
-        logOutput_ = new Fl_Multiline_Output(40, 674, 938, 64);
+        logBuffer_ = new Fl_Text_Buffer();
+        logOutput_ = new Fl_Text_Display(40, 674, 938, 64);
+        logOutput_->buffer(logBuffer_);
         logOutput_->color(kPanel);
         logOutput_->textcolor(kText);
         logOutput_->textsize(11);
+        logOutput_->wrap_mode(Fl_Text_Display::WRAP_AT_BOUNDS, 0);
+        logOutput_->scrollbar_width(10);
         logOutput_->box(FL_DOWN_FRAME);
+        logOutput_->show_cursor(0);
 
         mainTab_->end();
 
@@ -603,8 +614,11 @@ private:
             TrackItem track;
             track.id = entry.value("id", std::string{});
             track.url = entry.value("url", std::string{});
-            track.title = entry.value("title", std::string{"Untitled track"});
-            track.artist = entry.value("artist", std::string{});
+            track.title = trim(entry.value("title", std::string{}));
+            if (track.title.empty()) {
+                track.title = track.id.empty() ? "Unknown track" : "Track " + track.id;
+            }
+            track.artist = trim(entry.value("artist", std::string{}));
             track.thumbnail = entry.value("thumbnail", std::string{});
             track.duration = entry.value("duration", 0.0);
             const std::string duration = durationText(track.duration);
@@ -615,7 +629,11 @@ private:
             std::string label = track.title;
             if (!track.artist.empty()) label += "  —  " + track.artist;
             if (!duration.empty()) label += "   ·   " + duration;
-            auto* text = new Fl_Box(82, y, 865, 34, label.c_str());
+            // FLTK widget labels are not copied by the constructor. The old
+            // local std::string died at the end of this loop iteration, leaving
+            // a dangling pointer that rendered as random glyphs in the track list.
+            auto* text = new Fl_Box(82, y, 865, 34);
+            text->copy_label(label.c_str());
             text->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
             text->labelcolor(kText);
             text->labelsize(13);
@@ -642,8 +660,22 @@ private:
 
     void log(const std::string& message) {
         logs_ += message + "\n";
-        if (logs_.size() > 7000) logs_.erase(0, logs_.size() - 6000);
-        if (logOutput_) logOutput_->value(logs_.c_str());
+        if (logs_.size() > 7000) {
+            const std::size_t trimAt = logs_.size() - 6000;
+            const std::size_t nextLine = logs_.find('\n', trimAt);
+            logs_.erase(0, nextLine == std::string::npos ? trimAt : nextLine + 1);
+        }
+        if (logBuffer_ && logOutput_) {
+            logBuffer_->text(logs_.c_str());
+            // Keep the newest event visible while retaining a real scrollbar
+            // so users can scroll back through previous activity.
+            const int lastLine = logOutput_->count_lines(0, logBuffer_->length(), false);
+            const int lineHeight = std::max(1, static_cast<int>(logOutput_->textsize()) + 2);
+            const int visibleLines = std::max(1, (logOutput_->h() - 4) / lineHeight);
+            logOutput_->scroll(std::max(0, lastLine - visibleLines + 1), 0);
+            logOutput_->insert_position(logBuffer_->length());
+            logOutput_->redraw();
+        }
     }
 
     void processEvents() {
@@ -669,11 +701,15 @@ private:
             status_->copy_label(message.c_str());
             log("Backend: " + message);
         } else if (type == "download_started") {
-            status_->label("Downloading…");
+            const std::string message = event.value("message", std::string{"Download queue started"});
+            status_->copy_label(message.c_str());
+            log(message);
         } else if (type == "track_started") {
-            const std::string title = event.value("title", std::string{"Track"});
-            status_->copy_label(("Downloading: " + title).c_str());
-            log("Started: " + title);
+            const std::string title = event.value("title", std::string{"Unknown track"});
+            const std::string artist = event.value("artist", std::string{});
+            const std::string displayName = artist.empty() ? title : title + " — " + artist;
+            status_->copy_label(("Downloading: " + displayName).c_str());
+            log("Downloading: " + displayName);
         } else if (type == "progress") {
             const double percent = std::clamp(event.value("percent", 0.0), 0.0, 100.0);
             progress_->value(static_cast<float>(percent));
@@ -685,8 +721,9 @@ private:
             if (!eta.empty() && eta != "NA") label += " · ETA " + eta;
             status_->copy_label(label.c_str());
         } else if (type == "track_saved") {
+            const std::string title = event.value("title", std::string{"Track"});
             const std::string path = event.value("path", std::string{});
-            log("Saved: " + path);
+            log("Saved: " + title + (path.empty() ? std::string{} : " → " + path));
         } else if (type == "track_error") {
             const std::string title = event.value("title", std::string{"Track"});
             const std::string message = event.value("message", std::string{"Download failed"});
@@ -730,7 +767,8 @@ private:
     Fl_Box* trackCount_ = nullptr;
     Fl_Progress* progress_ = nullptr;
     Fl_Box* status_ = nullptr;
-    Fl_Multiline_Output* logOutput_ = nullptr;
+    Fl_Text_Display* logOutput_ = nullptr;
+    Fl_Text_Buffer* logBuffer_ = nullptr;
     Fl_Check_Button* proxyToggle_ = nullptr;
     Fl_Input* proxyInput_ = nullptr;
     Fl_Input* pathInput_ = nullptr;
